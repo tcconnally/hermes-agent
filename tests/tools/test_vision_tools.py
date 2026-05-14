@@ -17,8 +17,11 @@ from tools.vision_tools import (
     _image_to_base64_data_url,
     _resize_image_for_vision,
     _is_image_size_error,
+    _image_exceeds_pixel_cap,
+    _get_image_dimensions,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
+    _MAX_IMAGE_DIMENSION,
     vision_analyze_tool,
     check_vision_requirements,
 )
@@ -888,6 +891,146 @@ class TestResizeImageForVision:
                 result = _resize_image_for_vision(path, max_base64_bytes=100)
                 # Should return the original (oversized) data url
                 assert len(result) > 100
+
+
+# ---------------------------------------------------------------------------
+# Pixel-dimension cap — Anthropic rejects >8000 px on either axis as
+# non_retryable_client_error, which permanently bricks the session via the
+# native fast path (image gets inlined into the tool-result envelope before
+# the API call fails).  See `_MAX_IMAGE_DIMENSION`.
+# ---------------------------------------------------------------------------
+
+
+class TestPixelDimensionCap:
+    """Tests for the per-axis pixel cap enforcement."""
+
+    def test_max_dimension_below_anthropic_limit(self):
+        """The cap must stay strictly below Anthropic's 8000 px hard limit."""
+        assert _MAX_IMAGE_DIMENSION < 8000
+
+    def test_get_dimensions_reads_header(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        img = Image.new("RGB", (123, 456), (0, 0, 0))
+        path = tmp_path / "dims.png"
+        img.save(path, "PNG")
+        assert _get_image_dimensions(path) == (123, 456)
+
+    def test_exceeds_cap_wide(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        img = Image.new("RGB", (_MAX_IMAGE_DIMENSION + 100, 200), (0, 0, 0))
+        path = tmp_path / "wide.png"
+        img.save(path, "PNG")
+        assert _image_exceeds_pixel_cap(path) is True
+
+    def test_exceeds_cap_tall(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        img = Image.new("RGB", (200, _MAX_IMAGE_DIMENSION + 100), (0, 0, 0))
+        path = tmp_path / "tall.png"
+        img.save(path, "PNG")
+        assert _image_exceeds_pixel_cap(path) is True
+
+    def test_within_cap(self, tmp_path):
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        img = Image.new("RGB", (4000, 3000), (0, 0, 0))
+        path = tmp_path / "ok.png"
+        img.save(path, "PNG")
+        assert _image_exceeds_pixel_cap(path) is False
+
+    def test_no_pillow_returns_false(self, tmp_path):
+        """Without Pillow, the dimension check is a no-op (byte guard remains)."""
+        path = tmp_path / "fake.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        with patch.dict("sys.modules", {"PIL": None, "PIL.Image": None}):
+            assert _image_exceeds_pixel_cap(path) is False
+            assert _get_image_dimensions(path) is None
+
+    def test_resize_clamps_oversized_dimension(self, tmp_path):
+        """A 10000x100 image must come back ≤ _MAX_IMAGE_DIMENSION on the long side.
+
+        This is the regression test for the bug: an image well under 20 MB
+        base64 but >8000 px on one axis would slip through and brick the
+        session.  After the fix, ``_resize_image_for_vision`` must clamp
+        dimensions to the cap regardless of byte size.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        # 10000x100 solid-colour PNG compresses to a few KB — well under any
+        # byte cap — but violates the pixel-dimension cap.
+        img = Image.new("RGB", (10000, 100), (50, 100, 150))
+        path = tmp_path / "wide.png"
+        img.save(path, "PNG")
+
+        result = _resize_image_for_vision(path, mime_type="image/png")
+        assert result.startswith("data:image/png;base64,")
+
+        # Decode the returned data URL and assert dimensions
+        import base64
+        from io import BytesIO
+        _, b64data = result.split(",", 1)
+        decoded = Image.open(BytesIO(base64.b64decode(b64data)))
+        assert decoded.width <= _MAX_IMAGE_DIMENSION
+        assert decoded.height <= _MAX_IMAGE_DIMENSION
+        # Aspect ratio should be roughly preserved
+        original_ratio = 10000 / 100  # 100:1
+        new_ratio = decoded.width / max(decoded.height, 1)
+        # Proportional clamp ⇒ ratio preserved within rounding tolerance.
+        # Pillow's int rounding can cost ~1% on extreme aspect ratios.
+        assert new_ratio >= original_ratio * 0.95, (
+            f"Aspect ratio drifted: {decoded.width}x{decoded.height} "
+            f"(ratio {new_ratio:.1f}, original {original_ratio:.1f})"
+        )
+
+    def test_resize_clamps_oversized_tall_image(self, tmp_path):
+        """Mirror of the wide case for the tall axis."""
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        img = Image.new("RGB", (100, 10000), (150, 100, 50))
+        path = tmp_path / "tall.png"
+        img.save(path, "PNG")
+
+        result = _resize_image_for_vision(path, mime_type="image/png")
+        import base64
+        from io import BytesIO
+        _, b64data = result.split(",", 1)
+        decoded = Image.open(BytesIO(base64.b64decode(b64data)))
+        assert decoded.width <= _MAX_IMAGE_DIMENSION
+        assert decoded.height <= _MAX_IMAGE_DIMENSION
+
+    def test_resize_within_cap_not_dimension_clamped(self, tmp_path):
+        """An image already within the cap shouldn't be dimension-clamped.
+
+        (Byte-size resize may still apply for very large files, but a 4000x3000
+        image small enough in bytes should pass through untouched.)
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        img = Image.new("RGB", (4000, 3000), (0, 128, 255))
+        path = tmp_path / "ok.png"
+        img.save(path, "PNG")
+        result = _resize_image_for_vision(path, mime_type="image/png")
+        import base64
+        from io import BytesIO
+        _, b64data = result.split(",", 1)
+        decoded = Image.open(BytesIO(base64.b64decode(b64data)))
+        assert decoded.size == (4000, 3000)
 
 
 # ---------------------------------------------------------------------------

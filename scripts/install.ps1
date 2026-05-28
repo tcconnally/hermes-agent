@@ -39,7 +39,24 @@ param(
 
     # --- Ensure mode (dep_ensure.py entry point) ---
     [string]$Ensure = "",
-    [switch]$PostInstall
+    [switch]$PostInstall,
+
+    # --- Desktop GUI build (opt-in) ---
+    # When set, install.ps1 includes Stage-Desktop in the manifest and
+    # builds apps/desktop into a launchable Hermes.exe.
+    #
+    # Why opt-in:
+    #   * Hermes-Setup.exe (the signed Tauri bootstrap installer) passes
+    #     -IncludeDesktop so a user who installed via the GUI ends up
+    #     with a launchable desktop binary.
+    #   * The Electron desktop's own bootstrap-runner.cjs runs install.ps1
+    #     from inside an already-launched Hermes.exe; if THAT recursively
+    #     built apps/desktop it would try to overwrite the live Hermes.exe
+    #     on disk and fail. The recursive path omits the flag.
+    #   * The canonical CLI one-liner (irm | iex) omits the flag too;
+    #     terminal users don't need a desktop binary built for them, and
+    #     `hermes desktop` already builds on demand.
+    [switch]$IncludeDesktop
 )
 
 $ErrorActionPreference = "Stop"
@@ -1820,6 +1837,136 @@ function Install-NodeDeps {
     }
 }
 
+function Install-Desktop {
+    # Build apps/desktop into a launchable Hermes.exe. Only called from
+    # Stage-Desktop, which is itself only included in the manifest when
+    # -IncludeDesktop was passed to install.ps1.
+    #
+    # The workspace npm install at repo root (done by Install-NodeDeps for
+    # browser tools) does NOT pull apps/desktop's dependencies, because the
+    # browser-tools workspace at $InstallDir\package.json is a separate
+    # workspace from apps/*. We do a full root-level `npm install` here
+    # so the workspace resolves apps/desktop's deps (including Electron
+    # itself, ~150MB), then run `npm run pack` in apps/desktop which
+    # produces the unpacked binary at apps/desktop/release/<os>-unpacked/.
+    #
+    # The Tauri bootstrap installer's launch_hermes_desktop command
+    # resolves apps/desktop/release/win-unpacked/Hermes.exe directly,
+    # so an "unpacked" build (electron-builder --dir) is enough — we
+    # don't need to produce an NSIS/MSI artifact here.
+
+    if (-not $HasNode) {
+        Write-Warn "Skipping desktop build (Node.js not installed)"
+        $script:_StageSkippedReason = "Node.js not available"
+        return
+    }
+
+    $desktopDir = "$InstallDir\apps\desktop"
+    if (-not (Test-Path "$desktopDir\package.json")) {
+        Write-Warn "Skipping desktop build (apps/desktop not present in checkout)"
+        $script:_StageSkippedReason = "apps/desktop not present"
+        return
+    }
+
+    $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
+    if (-not $npmCmd) {
+        Write-Warn "Skipping desktop build (npm not on PATH)"
+        $script:_StageSkippedReason = "npm not found"
+        return
+    }
+    $npmExe = $npmCmd.Source
+    if ($npmExe -like "*.ps1") {
+        $sibling = Join-Path (Split-Path $npmExe -Parent) "npm.cmd"
+        if (Test-Path $sibling) { $npmExe = $sibling }
+    }
+
+    # 1. Workspace-level install so apps/desktop's deps (Electron, Vite,
+    # node-pty prebuilds, etc.) actually land in node_modules. This is
+    # the SAME `npm install` Install-NodeDeps does for browser tools,
+    # but at the root rather than the browser-tools workspace, so all
+    # apps/* workspaces resolve.
+    Write-Info "Installing desktop workspace dependencies (this includes Electron ~150MB)..."
+    $installLog = "$env:TEMP\hermes-npm-desktop-install-$(Get-Random).log"
+    Push-Location $InstallDir
+    $prevEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $npmExe install --silent 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $installLog
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+        if ($code -ne 0) {
+            $errText = Get-Content $installLog -Raw -ErrorAction SilentlyContinue
+            if ($errText) {
+                $snippet = if ($errText.Length -gt 1200) { $errText.Substring(0, 1200) + "..." } else { $errText }
+                Write-Info "  npm install output:"
+                foreach ($line in $snippet -split "`n") { Write-Host "    $line" -ForegroundColor DarkGray }
+                Write-Info "  Full log: $installLog"
+            }
+            throw "desktop workspace npm install failed (exit $code)"
+        }
+        Write-Success "Desktop workspace dependencies installed"
+        Remove-Item -Force $installLog -ErrorAction SilentlyContinue
+    } catch {
+        if ($prevEAP) { $ErrorActionPreference = $prevEAP }
+        Pop-Location
+        throw
+    }
+    Pop-Location
+
+    # 2. Build apps/desktop. `npm run pack` runs:
+    #      assert-root-install + write-build-stamp + stage-native-deps +
+    #      tsc -b + vite build + electron-builder --dir
+    # The --dir mode produces an unpacked Hermes.exe in
+    # apps/desktop/release/win-unpacked/ without bundling NSIS/MSI;
+    # we don't need a distributable installer artifact, just a
+    # launchable binary the Tauri installer can spawn.
+    Write-Info "Building desktop app (this takes 1-3 minutes)..."
+    $buildLog = "$env:TEMP\hermes-desktop-build-$(Get-Random).log"
+    Push-Location $desktopDir
+    $prevEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $npmExe run pack 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+        if ($code -ne 0) {
+            $errText = Get-Content $buildLog -Raw -ErrorAction SilentlyContinue
+            if ($errText) {
+                $snippet = if ($errText.Length -gt 1800) { $errText.Substring(0, 1800) + "..." } else { $errText }
+                Write-Info "  desktop build output:"
+                foreach ($line in $snippet -split "`n") { Write-Host "    $line" -ForegroundColor DarkGray }
+                Write-Info "  Full log: $buildLog"
+            }
+            throw "apps/desktop build failed (exit $code)"
+        }
+        Write-Success "Desktop app built"
+        Remove-Item -Force $buildLog -ErrorAction SilentlyContinue
+    } catch {
+        if ($prevEAP) { $ErrorActionPreference = $prevEAP }
+        Pop-Location
+        throw
+    }
+    Pop-Location
+
+    # 3. Sanity-check the produced binary. Probe both arches so this works
+    # on x64 and arm64 build machines.
+    $exeCandidates = @(
+        "$desktopDir\release\win-unpacked\Hermes.exe",
+        "$desktopDir\release\win-arm64-unpacked\Hermes.exe"
+    )
+    $found = $false
+    foreach ($cand in $exeCandidates) {
+        if (Test-Path $cand) {
+            Write-Success "Desktop ready: $cand"
+            $found = $true
+            break
+        }
+    }
+    if (-not $found) {
+        throw "Desktop build completed but no Hermes.exe was found under $desktopDir\release\*-unpacked\"
+    }
+}
+
 function Install-PlatformSdks {
     # Ensure messaging-platform SDKs matching tokens the user added to
     # ~/.hermes/.env are importable.  Two problems this solves:
@@ -2177,6 +2324,14 @@ $InstallStages = @(
     @{ Name = "venv";             Title = "Creating Python virtual environment";  Category = "install";      NeedsUserInput = $false; Worker = "Stage-Venv" }
     @{ Name = "dependencies";     Title = "Installing Python dependencies";       Category = "install";      NeedsUserInput = $false; Worker = "Stage-Dependencies" }
     @{ Name = "node-deps";        Title = "Installing Node.js dependencies";      Category = "install";      NeedsUserInput = $false; Worker = "Stage-NodeDeps" }
+)
+if ($IncludeDesktop) {
+    # Insert AFTER node-deps so workspace npm is already installed when
+    # the desktop build runs. Inserted only when explicitly requested
+    # (Hermes-Setup.exe), never via the irm|iex CLI one-liner.
+    $InstallStages += @{ Name = "desktop"; Title = "Building desktop app"; Category = "install"; NeedsUserInput = $false; Worker = "Stage-Desktop" }
+}
+$InstallStages += @(
     @{ Name = "path";             Title = "Adding Hermes to PATH";                Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-Path" }
     @{ Name = "config-templates"; Title = "Writing configuration templates";      Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-ConfigTemplates" }
     @{ Name = "platform-sdks";    Title = "Installing messaging platform SDKs";   Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-PlatformSdks" }
@@ -2216,6 +2371,7 @@ function Stage-Repository       { Install-Repository }
 function Stage-Venv             { Resolve-UvCmd; Install-Venv }
 function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
 function Stage-NodeDeps         { Install-NodeDeps }
+function Stage-Desktop          { Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
 function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }

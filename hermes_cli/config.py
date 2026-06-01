@@ -1514,7 +1514,7 @@ DEFAULT_CONFIG = {
     # for Lossless Context Management).  The engine must be installed as
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
-        "engine": "compressor",
+        "engine": "perseus",  # Perseus: live context injection + delegated compaction
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt

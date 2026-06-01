@@ -298,6 +298,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
+        # Engine-provided session context (e.g. Perseus live health checks,
+        # @query directive output, workspace status).  Injected here so it
+        # participates in the session cache and survives the full session.
+        if hasattr(agent, "context_compressor") and agent.context_compressor:
+            try:
+                engine_context = agent.context_compressor.get_session_context()
+                if engine_context:
+                    context_parts.append(engine_context)
+            except Exception:
+                pass  # engine doesn't support injection or call failed
+
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 

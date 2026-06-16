@@ -205,24 +205,6 @@ class ContextEngine(ABC):
             "compression_count": self.compression_count,
         }
 
-    # -- Optional: context injection ----------------------------------------
-
-    def get_session_context(self) -> str:
-        """Return engine-provided context to inject into the system prompt.
-
-        Called by ``system_prompt.build_system_prompt_parts()`` at
-        session start.  The default implementation returns an empty
-        string (no injection).  Override in subclasses (e.g. Perseus)
-        to provide live context — health checks, workspace state,
-        directive output — that the agent needs at the start of every
-        session.
-
-        The returned string is included in the ``# Project Context``
-        section alongside other context files like AGENTS.md and
-        .cursorrules.
-        """
-        return ""
-
     # -- Optional: model switch support ------------------------------------
 
     def update_model(

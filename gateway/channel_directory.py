@@ -289,7 +289,7 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
                 "thread_id": origin.get("thread_id"),
             })
     except Exception as e:
-        logger.debug("Channel directory: failed to read sessions for %s: %s", platform_name, e)
+        logger.warning("Channel directory: failed to read sessions for %s: %s", platform_name, e)
 
     return entries
 

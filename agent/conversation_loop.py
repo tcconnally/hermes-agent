@@ -2911,6 +2911,27 @@ def run_conversation(
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
+                # ── Affordable-tokens clamp (402 "can only afford N") ──────
+                # When the provider returns a 402 with "can only afford N tokens",
+                # the account HAS credit — just not enough for the requested
+                # max_tokens.  Clamp the output cap and retry instead of falling
+                # back or aborting.  See issue #49769.
+                affordable_tokens = (
+                    classified.error_context.get("affordable_max_tokens")
+                    if classified.reason == FailoverReason.rate_limit
+                    else None
+                )
+                if affordable_tokens is not None:
+                    safe_out = max(1, affordable_tokens - 64)
+                    agent._ephemeral_max_output_tokens = safe_out
+                    agent._buffer_vprint(
+                        f"⚠️  Requested max_tokens exceeds affordable balance — "
+                        f"retrying with max_tokens={safe_out:,} "
+                        f"(affordable={affordable_tokens:,})"
+                    )
+                    retry_count = 0
+                    continue
+
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
                 # and transport errors (connection failure / timeout / provider
                 # overloaded).  Rate limits and billing: switch immediately —

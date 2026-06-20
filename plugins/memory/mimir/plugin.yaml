@@ -1,0 +1,5 @@
+name: mimir
+version: 0.1.0
+description: "Mimir — encrypted persistent memory for Hermes. 27 MCP tools (remember, recall, search, forget, decay, vault, embed, prune), AES-256-GCM encryption, hybrid FTS5+embeddings+RRF search, confidence decay, and a single Rust binary with embedded SQLite. All local-first."
+pip_dependencies:
+  - hermes-mimir

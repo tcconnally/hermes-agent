@@ -11667,7 +11667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock, _kill_orphaned_mcp_children
 
             # Capture old server names before shutdown
             with _lock:
@@ -11676,6 +11676,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
             await loop.run_in_executor(None, shutdown_mcp_servers)
+            # Reap any stdio subprocesses that survived shutdown (#47510)
+            await loop.run_in_executor(None, _kill_orphaned_mcp_children)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
             new_tools = await loop.run_in_executor(None, discover_mcp_tools)
@@ -17549,8 +17551,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Close MCP server connections
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
+        from tools.mcp_tool import shutdown_mcp_servers, _kill_orphaned_mcp_children
         shutdown_mcp_servers()
+        # Reap all stdio subprocesses including active ones — final shutdown (#47510)
+        _kill_orphaned_mcp_children(include_active=True)
     except Exception:
         pass
 
